@@ -14,6 +14,7 @@ type JsonValue =
 type ProxyBuildResult = {
   body?: BodyInit | null;
   normalizedCount: number;
+  shouldNormalizeStream: boolean;
 };
 
 function getEnvNumber(name: string, fallback: number): number {
@@ -224,6 +225,13 @@ function normalizeMessages(payload: Record<string, JsonValue>): number {
     !Array.isArray(payload.modalities)
   ) {
     payload.modalities = payload.output_modalities;
+  } else if (
+    !Array.isArray(payload.output_modalities) &&
+    !Array.isArray(payload.modalities)
+  ) {
+    // OpenAI-compatible clients usually expect text-only output by default.
+    payload.output_modalities = ["text"];
+    payload.modalities = ["text"];
   }
 
   return normalizedCount;
@@ -255,20 +263,28 @@ async function buildProxyBody(
   pathname: string,
 ): Promise<ProxyBuildResult> {
   if (request.method === "GET" || request.method === "HEAD") {
-    return { body: null, normalizedCount: 0 };
+    return { body: null, normalizedCount: 0, shouldNormalizeStream: false };
   }
 
   if (!isJsonRequest(request.headers.get("content-type"))) {
-    return { body: request.body, normalizedCount: 0 };
+    return {
+      body: request.body,
+      normalizedCount: 0,
+      shouldNormalizeStream: false,
+    };
   }
 
   const rawBody = await request.text();
   if (!rawBody) {
-    return { body: rawBody, normalizedCount: 0 };
+    return { body: rawBody, normalizedCount: 0, shouldNormalizeStream: false };
   }
 
   if (pathname !== "/v1/chat/completions") {
-    return { body: rawBody, normalizedCount: 0 };
+    return {
+      body: rawBody,
+      normalizedCount: 0,
+      shouldNormalizeStream: false,
+    };
   }
 
   let parsed: JsonValue;
@@ -279,15 +295,22 @@ async function buildProxyBody(
   }
 
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return { body: rawBody, normalizedCount: 0 };
+    return {
+      body: rawBody,
+      normalizedCount: 0,
+      shouldNormalizeStream: false,
+    };
   }
 
   const payload = cloneJson(parsed as Record<string, JsonValue>);
   const normalizedCount = normalizeMessages(payload);
+  const shouldNormalizeStream = payload.model === TARGET_MODEL &&
+    payload.stream === true;
 
   return {
     body: JSON.stringify(payload),
     normalizedCount,
+    shouldNormalizeStream,
   };
 }
 
@@ -343,6 +366,140 @@ function buildProxyResponseHeaders(
   headers.set("access-control-allow-headers", "*");
   headers.set("access-control-allow-methods", "*");
   return headers;
+}
+
+function isEventStreamResponse(contentType: string | null): boolean {
+  return typeof contentType === "string" &&
+    contentType.toLowerCase().includes("text/event-stream");
+}
+
+function buildOpenAIChunk(
+  payload: Record<string, JsonValue>,
+): Record<string, JsonValue> | null {
+  if (!Array.isArray(payload.choices)) {
+    return null;
+  }
+
+  const firstChoice = payload.choices[0];
+  if (!isRecord(firstChoice)) {
+    return null;
+  }
+
+  const deltaInput = isRecord(firstChoice.delta)
+    ? firstChoice.delta
+    : {} as Record<string, JsonValue>;
+  const deltaOutput: Record<string, JsonValue> = {};
+
+  if (typeof deltaInput.role === "string") {
+    deltaOutput.role = deltaInput.role;
+  }
+
+  if (typeof deltaInput.content === "string") {
+    deltaOutput.content = deltaInput.content;
+  }
+
+  const responseId = typeof deltaInput.response_id === "string"
+    ? deltaInput.response_id
+    : typeof payload.session_id === "string"
+    ? payload.session_id
+    : `longcat-${crypto.randomUUID()}`;
+
+  return {
+    id: responseId,
+    object: "chat.completion.chunk",
+    created: typeof payload.created === "number"
+      ? payload.created
+      : Math.floor(Date.now() / 1000),
+    model: typeof payload.model === "string" ? payload.model : TARGET_MODEL,
+    choices: [{
+      index: 0,
+      delta: deltaOutput,
+      finish_reason: firstChoice.finish_reason ?? null,
+    }],
+  };
+}
+
+function normalizeEventStream(
+  upstreamBody: ReadableStream<Uint8Array>,
+): ReadableStream<Uint8Array> {
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+
+  let buffer = "";
+
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const reader = upstreamBody.getReader();
+
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) {
+            break;
+          }
+
+          buffer += decoder.decode(value, { stream: true });
+
+          while (true) {
+            const separatorIndex = buffer.indexOf("\n\n");
+            if (separatorIndex === -1) {
+              break;
+            }
+
+            const rawEvent = buffer.slice(0, separatorIndex);
+            buffer = buffer.slice(separatorIndex + 2);
+
+            if (!rawEvent.trim()) {
+              continue;
+            }
+
+            const dataLines = rawEvent.split("\n")
+              .filter((line) => line.startsWith("data:"))
+              .map((line) => line.slice(5).trim());
+            const dataText = dataLines.join("\n");
+
+            if (!dataText) {
+              continue;
+            }
+
+            if (dataText === "[DONE]") {
+              controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+              continue;
+            }
+
+            let parsed: JsonValue;
+            try {
+              parsed = JSON.parse(dataText) as JsonValue;
+            } catch {
+              continue;
+            }
+
+            if (!isRecord(parsed)) {
+              continue;
+            }
+
+            const chunk = buildOpenAIChunk(parsed);
+            if (!chunk) {
+              continue;
+            }
+
+            controller.enqueue(
+              encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`),
+            );
+          }
+        }
+
+        if (buffer.trim()) {
+          controller.enqueue(encoder.encode(buffer));
+        }
+      } catch (error) {
+        controller.error(error);
+      } finally {
+        reader.releaseLock();
+        controller.close();
+      }
+    },
+  });
 }
 
 async function handleProxy(request: Request): Promise<Response> {
@@ -408,7 +565,13 @@ async function handleProxy(request: Request): Promise<Response> {
     redirect: "manual",
   });
 
-  return new Response(upstreamResponse.body, {
+  const responseBody = proxyBuild.shouldNormalizeStream &&
+      upstreamResponse.body &&
+      isEventStreamResponse(upstreamResponse.headers.get("content-type"))
+    ? normalizeEventStream(upstreamResponse.body)
+    : upstreamResponse.body;
+
+  return new Response(responseBody, {
     status: upstreamResponse.status,
     statusText: upstreamResponse.statusText,
     headers: buildProxyResponseHeaders(
