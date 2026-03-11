@@ -1,0 +1,8 @@
+{
+  "tasks": {
+    "check": "deno check main.ts",
+    "dev": "deno run --allow-env --allow-net main.ts",
+    "fmt": "deno fmt main.ts",
+    "start": "deno run --allow-env --allow-net main.ts"
+  }
+}
