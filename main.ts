@@ -285,6 +285,48 @@ function normalizeAudioPart(
   };
 }
 
+function isTextPart(value: JsonValue): boolean {
+  return isRecord(value) && value.type === "text" &&
+    typeof value.text === "string";
+}
+
+function isMediaPart(value: JsonValue): boolean {
+  return isRecord(value) && typeof value.type === "string" && [
+    "image_url",
+    "input_image",
+    "video_url",
+    "input_video",
+    "input_audio",
+  ].includes(value.type);
+}
+
+function reorderMultimodalParts(content: JsonValue[]): JsonValue[] {
+  let hasMedia = false;
+  let hasText = false;
+  const nonTextParts: JsonValue[] = [];
+  const textParts: JsonValue[] = [];
+
+  for (const entry of content) {
+    if (isTextPart(entry)) {
+      hasText = true;
+      textParts.push(entry);
+      continue;
+    }
+
+    if (isMediaPart(entry)) {
+      hasMedia = true;
+    }
+
+    nonTextParts.push(entry);
+  }
+
+  if (!hasMedia || !hasText) {
+    return content;
+  }
+
+  return [...nonTextParts, ...textParts];
+}
+
 function normalizeContentParts(
   content: JsonValue[],
   textHint: string,
@@ -313,7 +355,7 @@ function normalizeContentParts(
     }
   });
 
-  return { content: nextParts, count };
+  return { content: reorderMultimodalParts(nextParts), count };
 }
 
 function normalizeMessages(payload: Record<string, JsonValue>): number {
