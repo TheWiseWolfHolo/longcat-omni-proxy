@@ -21,6 +21,7 @@ type JsonValue =
 type ProxyBuildResult = {
   body?: BodyInit | null;
   normalizedCount: number;
+  shouldReplayStream: boolean;
   shouldNormalizeStream: boolean;
 };
 
@@ -159,6 +160,26 @@ function extractTextHint(messages: JsonValue[]): string {
     }
   }
   return parts.join("\n");
+}
+
+function hasImageInput(messages: JsonValue[]): boolean {
+  for (const entry of messages) {
+    if (!isRecord(entry) || !Array.isArray(entry.content)) {
+      continue;
+    }
+
+    for (const part of entry.content) {
+      if (!isRecord(part) || typeof part.type !== "string") {
+        continue;
+      }
+
+      if (part.type === "image_url" || part.type === "input_image") {
+        return true;
+      }
+    }
+  }
+
+  return false;
 }
 
 function normalizeImagePart(
@@ -366,26 +387,38 @@ async function buildProxyBody(
   pathname: string,
 ): Promise<ProxyBuildResult> {
   if (request.method === "GET" || request.method === "HEAD") {
-    return { body: null, normalizedCount: 0, shouldNormalizeStream: false };
+    return {
+      body: null,
+      normalizedCount: 0,
+      shouldReplayStream: false,
+      shouldNormalizeStream: false,
+    };
   }
 
   if (!isJsonRequest(request.headers.get("content-type"))) {
     return {
       body: request.body,
       normalizedCount: 0,
+      shouldReplayStream: false,
       shouldNormalizeStream: false,
     };
   }
 
   const rawBody = await request.text();
   if (!rawBody) {
-    return { body: rawBody, normalizedCount: 0, shouldNormalizeStream: false };
+    return {
+      body: rawBody,
+      normalizedCount: 0,
+      shouldReplayStream: false,
+      shouldNormalizeStream: false,
+    };
   }
 
   if (pathname !== "/v1/chat/completions") {
     return {
       body: rawBody,
       normalizedCount: 0,
+      shouldReplayStream: false,
       shouldNormalizeStream: false,
     };
   }
@@ -401,18 +434,29 @@ async function buildProxyBody(
     return {
       body: rawBody,
       normalizedCount: 0,
+      shouldReplayStream: false,
       shouldNormalizeStream: false,
     };
   }
 
   const payload = cloneJson(parsed as Record<string, JsonValue>);
+  const originalStream = payload.stream === true;
+  const shouldReplayStream = payload.model === TARGET_MODEL &&
+    Array.isArray(payload.messages) &&
+    hasImageInput(payload.messages) &&
+    originalStream;
+  if (shouldReplayStream) {
+    payload.stream = false;
+  }
   const normalizedCount = normalizeMessages(payload);
   const shouldNormalizeStream = payload.model === TARGET_MODEL &&
-    payload.stream === true;
+    originalStream &&
+    !shouldReplayStream;
 
   return {
     body: JSON.stringify(payload),
     normalizedCount,
+    shouldReplayStream,
     shouldNormalizeStream,
   };
 }
@@ -605,6 +649,74 @@ function normalizeEventStream(
   });
 }
 
+function splitReplayText(content: string): string[] {
+  const chars = Array.from(content);
+  const chunks: string[] = [];
+  for (let i = 0; i < chars.length; i += 8) {
+    chunks.push(chars.slice(i, i + 8).join(""));
+  }
+  return chunks.filter((chunk) => chunk.length > 0);
+}
+
+function createReplayStream(
+  content: string,
+  model: string,
+  responseId: string,
+): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder();
+  const created = Math.floor(Date.now() / 1000);
+  const chunks = splitReplayText(content);
+
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      let index = 0;
+
+      const pushChunk = () => {
+        if (index < chunks.length) {
+          const payload = {
+            id: responseId,
+            object: "chat.completion.chunk",
+            created,
+            model,
+            choices: [{
+              index: 0,
+              delta: index === 0
+                ? { role: "assistant", content: chunks[index] }
+                : { content: chunks[index] },
+              finish_reason: null,
+            }],
+          };
+          controller.enqueue(
+            encoder.encode(`data: ${JSON.stringify(payload)}\n\n`),
+          );
+          index += 1;
+          queueMicrotask(pushChunk);
+          return;
+        }
+
+        const finalPayload = {
+          id: responseId,
+          object: "chat.completion.chunk",
+          created,
+          model,
+          choices: [{
+            index: 0,
+            delta: {},
+            finish_reason: "stop",
+          }],
+        };
+        controller.enqueue(
+          encoder.encode(`data: ${JSON.stringify(finalPayload)}\n\n`),
+        );
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      };
+
+      pushChunk();
+    },
+  });
+}
+
 async function handleProxy(request: Request): Promise<Response> {
   if (request.method === "OPTIONS") {
     return jsonResponse(204, {});
@@ -667,6 +779,55 @@ async function handleProxy(request: Request): Promise<Response> {
     body: proxyBuild.body,
     redirect: "manual",
   });
+
+  if (proxyBuild.shouldReplayStream) {
+    const replayHeaders = buildProxyResponseHeaders(
+      upstreamResponse.headers,
+      proxyBuild.normalizedCount,
+    );
+    replayHeaders.set("content-type", "text/event-stream");
+    replayHeaders.set("cache-control", "no-cache");
+
+    if (!upstreamResponse.ok) {
+      return new Response(await upstreamResponse.text(), {
+        status: upstreamResponse.status,
+        statusText: upstreamResponse.statusText,
+        headers: replayHeaders,
+      });
+    }
+
+    const upstreamJson = await upstreamResponse.json() as JsonValue;
+    if (!isRecord(upstreamJson)) {
+      return new Response("data: [DONE]\n\n", {
+        status: upstreamResponse.status,
+        statusText: upstreamResponse.statusText,
+        headers: replayHeaders,
+      });
+    }
+
+    const choices = Array.isArray(upstreamJson.choices)
+      ? upstreamJson.choices
+      : [];
+    const firstChoice = choices[0];
+    const message = isRecord(firstChoice) && isRecord(firstChoice.message)
+      ? firstChoice.message
+      : null;
+    const content = message && typeof message.content === "string"
+      ? message.content
+      : "";
+    const responseId = typeof upstreamJson.session_id === "string"
+      ? upstreamJson.session_id
+      : crypto.randomUUID();
+    const model = typeof upstreamJson.model === "string"
+      ? upstreamJson.model
+      : TARGET_MODEL;
+
+    return new Response(createReplayStream(content, model, responseId), {
+      status: upstreamResponse.status,
+      statusText: upstreamResponse.statusText,
+      headers: replayHeaders,
+    });
+  }
 
   const responseBody = proxyBuild.shouldNormalizeStream &&
       upstreamResponse.body &&
