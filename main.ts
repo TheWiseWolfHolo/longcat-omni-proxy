@@ -1,7 +1,14 @@
+import { PNG } from "npm:pngjs";
+import { Buffer } from "node:buffer";
+
 const TARGET_MODEL = "LongCat-Flash-Omni-2603";
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 8787;
 const DEFAULT_UPSTREAM_BASE_URL = "https://api.longcat.chat/openai";
+const SCREENSHOT_TOP_CROP_RATIO = 0.15;
+const SCREENSHOT_BOTTOM_CROP_RATIO = 0.10;
+const SCREENSHOT_MIN_WIDTH = 900;
+const SCREENSHOT_MIN_HEIGHT = 600;
 
 type JsonValue =
   | null
@@ -64,8 +71,99 @@ function stripDataUrlPrefix(value: string): string {
   return value.slice(commaIndex + 1);
 }
 
+function isLikelyScreenshotTextTask(textHint: string): boolean {
+  const normalized = textHint.toLowerCase();
+  return normalized.includes("ocr") ||
+    normalized.includes("提取") ||
+    normalized.includes("识别") ||
+    normalized.includes("根据图片生成 html") ||
+    normalized.includes("html 和 css");
+}
+
+function decodeBase64(value: string): Uint8Array {
+  const bin = atob(value);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i += 1) {
+    bytes[i] = bin.charCodeAt(i);
+  }
+  return bytes;
+}
+
+function encodeBase64(bytes: Uint8Array): string {
+  let result = "";
+  for (const byte of bytes) {
+    result += String.fromCharCode(byte);
+  }
+  return btoa(result);
+}
+
+function maybeCropScreenshotPngBase64(
+  base64Payload: string,
+  textHint: string,
+): string {
+  if (!isLikelyScreenshotTextTask(textHint)) {
+    return base64Payload;
+  }
+
+  try {
+    const png = PNG.sync.read(Buffer.from(decodeBase64(base64Payload)));
+    if (
+      png.width < SCREENSHOT_MIN_WIDTH ||
+      png.height < SCREENSHOT_MIN_HEIGHT
+    ) {
+      return base64Payload;
+    }
+
+    const topCrop = Math.floor(png.height * SCREENSHOT_TOP_CROP_RATIO);
+    const bottomCrop = Math.floor(png.height * SCREENSHOT_BOTTOM_CROP_RATIO);
+    const nextHeight = png.height - topCrop - bottomCrop;
+    if (nextHeight <= 0) {
+      return base64Payload;
+    }
+
+    const cropped = new PNG({ width: png.width, height: nextHeight });
+    for (let y = 0; y < nextHeight; y += 1) {
+      const sourceStart = ((y + topCrop) * png.width) * 4;
+      const sourceEnd = sourceStart + (png.width * 4);
+      const targetStart = (y * png.width) * 4;
+      cropped.data.set(
+        png.data.subarray(sourceStart, sourceEnd),
+        targetStart,
+      );
+    }
+
+    return encodeBase64(PNG.sync.write(cropped));
+  } catch {
+    return base64Payload;
+  }
+}
+
+function extractTextHint(messages: JsonValue[]): string {
+  const parts: string[] = [];
+  for (const entry of messages) {
+    if (!isRecord(entry)) {
+      continue;
+    }
+
+    if (typeof entry.content === "string") {
+      parts.push(entry.content);
+      continue;
+    }
+
+    if (Array.isArray(entry.content)) {
+      for (const part of entry.content) {
+        if (isRecord(part) && typeof part.text === "string") {
+          parts.push(part.text);
+        }
+      }
+    }
+  }
+  return parts.join("\n");
+}
+
 function normalizeImagePart(
   part: Record<string, JsonValue>,
+  textHint: string,
 ): Record<string, JsonValue> {
   const imageValue = part.image_url;
   let url = "";
@@ -81,11 +179,14 @@ function normalizeImagePart(
   }
 
   if (url.startsWith("data:")) {
+    const croppedPayload = url.startsWith("data:image/png;base64,")
+      ? maybeCropScreenshotPngBase64(stripDataUrlPrefix(url), textHint)
+      : stripDataUrlPrefix(url);
     return {
       type: "input_image",
       input_image: {
         type: "base64",
-        data: [stripDataUrlPrefix(url)],
+        data: [croppedPayload],
       },
     };
   }
@@ -165,6 +266,7 @@ function normalizeAudioPart(
 
 function normalizeContentParts(
   content: JsonValue[],
+  textHint: string,
 ): { content: JsonValue[]; count: number } {
   let count = 0;
   const nextParts = content.map((entry) => {
@@ -175,7 +277,7 @@ function normalizeContentParts(
     switch (entry.type) {
       case "image_url": {
         count += 1;
-        return normalizeImagePart(entry);
+        return normalizeImagePart(entry, textHint);
       }
       case "video_url": {
         count += 1;
@@ -199,6 +301,7 @@ function normalizeMessages(payload: Record<string, JsonValue>): number {
   }
 
   let normalizedCount = 0;
+  const textHint = extractTextHint(payload.messages);
 
   for (const entry of payload.messages) {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
@@ -213,7 +316,7 @@ function normalizeMessages(payload: Record<string, JsonValue>): number {
       }];
       normalizedCount += 1;
     } else if (Array.isArray(message.content)) {
-      const normalizedParts = normalizeContentParts(message.content);
+      const normalizedParts = normalizeContentParts(message.content, textHint);
       message.content = normalizedParts.content;
       normalizedCount += normalizedParts.count;
     }
