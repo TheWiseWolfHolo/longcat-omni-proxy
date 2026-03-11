@@ -292,13 +292,27 @@ async function buildProxyBody(
 }
 
 function resolveUpstreamAuthorization(headers: Headers): string {
+  const directAuthorization = headers.get("authorization");
+  if (directAuthorization) {
+    return directAuthorization;
+  }
+
   const envKey = Deno.env.get("LONGCAT_API_KEY") ??
     Deno.env.get("UPSTREAM_API_KEY");
   if (envKey) {
     return `Bearer ${envKey}`;
   }
 
-  return headers.get("authorization") ?? "";
+  return "";
+}
+
+function hasValidProxySecret(headers: Headers): boolean {
+  const requiredSecret = Deno.env.get("PROXY_SHARED_SECRET");
+  if (!requiredSecret) {
+    return true;
+  }
+
+  return headers.get("x-proxy-secret") === requiredSecret;
 }
 
 function buildUpstreamHeaders(source: Headers): Headers {
@@ -346,6 +360,15 @@ async function handleProxy(request: Request): Promise<Response> {
       upstream_base_url: stripTrailingSlash(
         Deno.env.get("UPSTREAM_BASE_URL") ?? DEFAULT_UPSTREAM_BASE_URL,
       ),
+    });
+  }
+
+  if (!hasValidProxySecret(request.headers)) {
+    return jsonResponse(401, {
+      error: {
+        message: "Missing or invalid x-proxy-secret.",
+        type: "authentication_error",
+      },
     });
   }
 

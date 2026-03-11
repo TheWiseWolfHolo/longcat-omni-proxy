@@ -26,6 +26,7 @@ Supported environment variables:
 - `LONGCAT_API_KEY`
 - `UPSTREAM_API_KEY`
 - `UPSTREAM_BASE_URL`
+- `PROXY_SHARED_SECRET`
 - `HOST`
 - `PORT`
 
@@ -40,3 +41,9 @@ Supported environment variables:
 - The proxy only rewrites requests for `LongCat-Flash-Omni-2603`.
 - Existing array-based multimodal content is preserved and only normalized when
   a LongCat-specific conversion is needed.
+- Incoming `Authorization` is preferred over env keys. This is important when
+  another proxy such as `gpt-load` is rotating upstream keys.
+- If you place `gpt-load` in front of this proxy, do not set `LONGCAT_API_KEY`
+  or `UPSTREAM_API_KEY` unless you intentionally want to bypass key rotation.
+- Optional hardening: set `PROXY_SHARED_SECRET` on this service and configure
+  `gpt-load` to send the same `x-proxy-secret` header upstream.
